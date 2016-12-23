@@ -13,6 +13,7 @@
 #    under the License.
 
 import mock
+from oslo_utils import units
 
 from os_win import exceptions
 from os_win.tests.unit import test_base
@@ -61,6 +62,7 @@ class NetworkUtilsTestCase(test_base.OsWinBaseTestCase):
         self.netutils._switch_ports = {}
         self.netutils._vlan_sds = {}
         self.netutils._vsid_sds = {}
+        self.netutils._bandwidth_sds = {}
         conn = self.netutils._conn
 
         mock_vswitch = mock.MagicMock(ElementName=mock.sentinel.vswitch_name)
@@ -76,6 +78,8 @@ class NetworkUtilsTestCase(test_base.OsWinBaseTestCase):
             mock_bad_sd, mock_sd]
         conn.Msvm_EthernetSwitchPortSecuritySettingData.return_value = [
             mock_bad_sd, mock_sd]
+        conn.Msvm_EthernetSwitchPortBandwidthSettingData.return_value = [
+            mock_bad_sd, mock_sd]
 
         self.netutils.init_caches()
 
@@ -85,6 +89,8 @@ class NetworkUtilsTestCase(test_base.OsWinBaseTestCase):
                          self.netutils._switch_ports)
         self.assertEqual([mock_sd], list(self.netutils._vlan_sds.values()))
         self.assertEqual([mock_sd], list(self.netutils._vsid_sds.values()))
+        self.assertEqual([mock_sd],
+                         list(self.netutils._bandwidth_sds.values()))
 
     def test_update_cache(self):
         conn = self.netutils._conn
@@ -698,6 +704,84 @@ class NetworkUtilsTestCase(test_base.OsWinBaseTestCase):
     def test_get_new_weights_allow(self):
         actual = self.netutils._get_new_weights([mock.ANY, mock.ANY], mock.ANY)
         self.assertEqual([0, 0], actual)
+
+    def test_set_port_qos_rule_early_exit(self):
+        self._mock_get_switch_port_alloc()
+        mock_bandwidth_settings = mock.MagicMock()
+
+        mock_remove_feature = self.netutils._jobutils.remove_virt_feature
+        self._check_set_port_qos_rule(
+            mock_bandwidth_settings=mock_bandwidth_settings)
+        self.assertFalse(mock_remove_feature.called)
+
+    def test_set_port_qos_rule(self):
+        mock_port_alloc = self._mock_get_switch_port_alloc()
+        mock_bandwidth_settings = mock.MagicMock()
+
+        mock_remove_feature = self.netutils._jobutils.remove_virt_feature
+        mock_add_feature = self.netutils._jobutils.add_virt_feature
+
+        self._check_set_port_qos_rule(
+            mock_bandwidth_settings=mock_bandwidth_settings,
+            early_exit=False)
+        mock_remove_feature.assert_called_once_with(
+            mock_bandwidth_settings)
+        mock_add_feature.assert_called_once_with(mock_bandwidth_settings,
+                                                 mock_port_alloc)
+
+    @mock.patch.object(networkutils.NetworkUtils,
+                       '_get_bandwidth_setting_data_from_port_alloc')
+    @mock.patch.object(networkutils.NetworkUtils,
+                       '_get_default_setting_data')
+    def _check_set_port_qos_rule(self, mock_get_default_sd,
+                                 mock_get_bandwidth_sd,
+                                 mock_bandwidth_settings,
+                                 early_exit=True):
+        mock_get_bandwidth_sd.return_value = mock_bandwidth_settings
+        mock_get_default_sd.return_value = mock_bandwidth_settings
+
+        if early_exit:
+            mock_bandwidth_settings.Reservation = 20000 * units.Ki
+            mock_bandwidth_settings.Limit = 20000 * units.Ki
+            mock_bandwidth_settings.BurstSize = 20000 * units.Ki
+            mock_bandwidth_settings.BurstLimit = 20000 * units.Ki
+
+        qos_rule = {'min_kbps': 20000, 'max_kbps': 20000}
+        self.netutils.set_port_qos_rule(mock.sentinel.port_id, qos_rule)
+
+    def test_dont_set_port_qos_rule(self):
+        qos_rule = {'min_kbps': 0, 'max_kbps': 0}
+        mock_port_alloc = self._mock_get_switch_port_alloc()
+
+        self.netutils.set_port_qos_rule(mock.sentinel.port_id, qos_rule)
+        self.assertFalse(mock_port_alloc.called)
+
+    def test_set_port_qos_rule_exceptions_min(self):
+        self._check_set_port_qos_rule_exceptions(min_kbps=100)
+
+    def test_set_port_qos_rule_exceptions_max(self):
+        self._check_set_port_qos_rule_exceptions(max_kbps=100)
+
+    def _check_set_port_qos_rule_exceptions(self, min_kbps=10 * units.Ki,
+                                            max_kbps=10 * units.Ki):
+        qos_rule = {'min_kbps': min_kbps, 'max_kbps': max_kbps}
+        self.assertRaises(exceptions.HyperVInvalidException,
+                          self.netutils.set_port_qos_rule,
+                          mock.sentinel.port_id,
+                          qos_rule)
+
+    @mock.patch.object(networkutils.NetworkUtils,
+                       '_get_bandwidth_setting_data_from_port_alloc')
+    def test_remove_port_qos_rule(self, mock_get_bandwidth_sd):
+        self._mock_get_switch_port_alloc()
+        mock_bandwidth_settings = mock.MagicMock()
+        mock_get_bandwidth_sd.return_value = mock_bandwidth_settings
+
+        self.netutils.remove_port_qos_rule(mock.sentinel.port_id)
+
+        mock_remove_feature = self.netutils._jobutils.remove_virt_feature
+        mock_remove_feature.assert_called_once_with(
+            mock_bandwidth_settings)
 
 
 class TestNetworkUtilsR2(test_base.OsWinBaseTestCase):

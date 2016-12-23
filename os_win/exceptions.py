@@ -77,6 +77,11 @@ class HyperVPortNotFoundException(NotFound, HyperVException):
     msg_fmt = _("Switch port not found: %(port_name)s")
 
 
+class HyperVInvalidException(HyperVException):
+    msg_fmt = _("Invalid parameter value for: "
+                "%(param_name)s=%(param_value)s")
+
+
 class SMBException(OSWinException):
     pass
 

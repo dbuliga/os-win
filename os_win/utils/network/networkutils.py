@@ -23,6 +23,7 @@ import re
 
 from eventlet import patcher
 from eventlet import tpool
+from oslo_utils import units
 
 from os_win._i18n import _
 from os_win import exceptions
@@ -43,6 +44,7 @@ class NetworkUtils(baseutils.BaseUtilsVirt):
     _PORT_VLAN_SET_DATA = 'Msvm_EthernetSwitchPortVlanSettingData'
     _PORT_SECURITY_SET_DATA = 'Msvm_EthernetSwitchPortSecuritySettingData'
     _PORT_ALLOC_ACL_SET_DATA = 'Msvm_EthernetSwitchPortAclSettingData'
+    _PORT_BANDWIDTH_SET_DATA = 'Msvm_EthernetSwitchPortBandwidthSettingData'
     _PORT_EXT_ACL_SET_DATA = _PORT_ALLOC_ACL_SET_DATA
     _LAN_ENDPOINT = 'Msvm_LANEndpoint'
     _STATE_DISABLED = 3
@@ -84,6 +86,7 @@ class NetworkUtils(baseutils.BaseUtilsVirt):
     _vlan_sds = {}
     _vsid_sds = {}
     _sg_acl_sds = {}
+    _bandwidth_sds = {}
 
     def __init__(self):
         super(NetworkUtils, self).__init__()
@@ -116,6 +119,14 @@ class NetworkUtils(baseutils.BaseUtilsVirt):
             match = switch_port_id_regex.match(vsid_sd.InstanceID)
             if match:
                 self._vsid_sds[match.group()] = vsid_sd
+
+        # map between switch port's InstanceID and their bandwidth setting
+        # data WMI objects.
+        bandwidths = self._conn.Msvm_EthernetSwitchPortBandwidthSettingData()
+        for bandwidth_sd in bandwidths:
+            match = switch_port_id_regex.match(bandwidth_sd.InstanceID)
+            if match:
+                self._bandwidth_sds[match.group()] = bandwidth_sd
 
     def update_cache(self):
         # map between switch port ID and switch port WMI object.
@@ -369,6 +380,10 @@ class NetworkUtils(baseutils.BaseUtilsVirt):
         return self._get_setting_data_from_port_alloc(
             port_alloc, self._vsid_sds, self._PORT_SECURITY_SET_DATA)
 
+    def _get_bandwidth_setting_data_from_port_alloc(self, port_alloc):
+        return self._get_setting_data_from_port_alloc(
+            port_alloc, self._bandwidth_sds, self._PORT_BANDWIDTH_SET_DATA)
+
     def _get_setting_data_from_port_alloc(self, port_alloc, cache, data_class):
         if port_alloc.InstanceID in cache:
             return cache[port_alloc.InstanceID]
@@ -592,6 +607,61 @@ class NetworkUtils(baseutils.BaseUtilsVirt):
                  have the recommended order for sg_rules' Action.
         """
         return [0] * len(sg_rules)
+
+    def set_port_qos_rule(self, port_id, qos_rule):
+        if qos_rule.get("min_kbps"):
+            qos_min = qos_rule["min_kbps"] * units.Ki
+            if qos_min < 10 * units.Mi:
+                raise exceptions.HyperVInvalidException(param_name="min_kbps",
+                                                        param_value=qos_min)
+        else:
+            qos_min = 0  # Set the default value
+
+        if qos_rule.get("max_kbps"):
+            qos_max = qos_rule["max_kbps"] * units.Ki
+            if qos_max < qos_min:
+                raise exceptions.HyperVInvalidException(param_name="max_kbps",
+                                                        param_value=qos_max)
+        else:
+            qos_max = 0  # Set the default value
+
+        if qos_max == 0 and qos_min == 0:
+            # no limits need to be set
+            return
+
+        port_alloc = self._get_switch_port_allocation(port_id)[0]
+        bandwidth = self._get_bandwidth_setting_data_from_port_alloc(
+            port_alloc)
+        if bandwidth:
+            if (bandwidth.Reservation == qos_min and
+                    bandwidth.Limit == qos_max and
+                    bandwidth.BurstSize == qos_max and
+                    bandwidth.BurstLimit == qos_max):
+                return
+            # Removing the feature because it cannot be modified
+            # due to a wmi exception.
+            self._jobutils.remove_virt_feature(bandwidth)
+
+            # remove from cache.
+            self._bandwidth_sds.pop(port_alloc.InstanceID, None)
+
+        bandwidth = self._get_default_setting_data(
+            self._PORT_BANDWIDTH_SET_DATA)
+        bandwidth.Reservation = qos_min
+        bandwidth.Limit = qos_max
+        bandwidth.BurstSize = qos_max
+        bandwidth.BurstLimit = qos_max
+
+        self._jobutils.add_virt_feature(bandwidth, port_alloc)
+
+    def remove_port_qos_rule(self, port_id):
+        port_alloc = self._get_switch_port_allocation(port_id)[0]
+        bandwidth = self._get_bandwidth_setting_data_from_port_alloc(
+            port_alloc)
+        if bandwidth:
+            self._jobutils.remove_virt_feature(bandwidth)
+            # remove from cache.
+            self._bandwidth_sds.pop(port_alloc.InstanceID, None)
 
 
 class NetworkUtilsR2(NetworkUtils):
